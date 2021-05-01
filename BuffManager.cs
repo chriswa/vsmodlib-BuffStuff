@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using ProtoBuf;
+using ProtoBuf.Meta;
 using Vintagestory.API.Common;
 using Vintagestory.API.Common.Entities;
 using Vintagestory.API.Server;
@@ -20,17 +22,31 @@ namespace BuffStuff {
       buffTypes[buffTypeId] = buffType;
     }
     private static SerializedBuff serializeBuff(Buff buff) {
+      MemoryStream memoryStream = new MemoryStream();
+      RuntimeTypeModel.Default.Serialize(memoryStream, buff);
+      var serializedBuffObjectBytes = memoryStream.ToArray();
       return new SerializedBuff() {
         id = buff.ID,
         timeRemainingInDays = buff.ExpireTimestampInDays - api.World.Calendar.TotalDays,
-        data = buff.Serialize()
-      };
+        tickCounter = buff.TickCounter,
+        data = serializedBuffObjectBytes // SerializerUtil.Serialize<object>(buff)
+    };
     }
     private static Buff deserializeBuff(SerializedBuff serializedBuff, Entity entity) {
-      var buff = (Buff)Activator.CreateInstance(buffTypes[serializedBuff.id]);
+      MemoryStream serializedBuffMemoryStream = new MemoryStream(serializedBuff.data);
+      Buff buff;
+      try {
+        buff = (Buff)RuntimeTypeModel.Default.Deserialize(serializedBuffMemoryStream, null, buffTypes[serializedBuff.id]);
+      }
+      catch {
+        return null;
+      }
+      finally {
+        serializedBuffMemoryStream.Dispose();
+      }
       buff.entity = entity;
       buff.ExpireTimestampInDays = api.World.Calendar.TotalDays + serializedBuff.timeRemainingInDays;
-      buff.Deserialize(serializedBuff.data);
+      buff.TickCounter = serializedBuff.tickCounter;
       return buff;
     }
     private static ICoreAPI api;
@@ -63,7 +79,7 @@ namespace BuffStuff {
           var playerUid = (serverPlayer.Entity as EntityPlayer).PlayerUID;
           if (inactiveBuffsByPlayerUid.TryGetValue(playerUid, out var inactiveBuffs)) {
             var now = Now;
-            activeBuffsByEntityAndBuffId[serverPlayer.Entity] = inactiveBuffs.Select(serializedBuff => deserializeBuff(serializedBuff, serverPlayer.Entity)).ToDictionary(buff => buff.ID, buff => buff);
+            activeBuffsByEntityAndBuffId[serverPlayer.Entity] = inactiveBuffs.Select(serializedBuff => deserializeBuff(serializedBuff, serverPlayer.Entity)).Where((buff) => buff != null).ToDictionary(buff => buff.ID, buff => buff);
             inactiveBuffsByPlayerUid.Remove(playerUid);
             foreach (var buffIdAndBuffPair in activeBuffsByEntityAndBuffId[serverPlayer.Entity]) {
               buffIdAndBuffPair.Value.OnJoin();
@@ -97,6 +113,7 @@ namespace BuffStuff {
           foreach (var entity in activeBuffsByEntityAndBuffId.Keys.ToArray()) {
             var activeBuffsByBuffId = activeBuffsByEntityAndBuffId[entity];
             foreach (var buff in activeBuffsByBuffId.Values.ToArray()) {
+              buff.TickCounter += 1;
               if (buff.ExpireTimestampInDays < now) {
                 buff.OnExpire();
                 RemoveBuff(entity, buff);

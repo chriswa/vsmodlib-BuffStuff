@@ -5,6 +5,7 @@ namespace BuffStuff {
   internal class SerializedBuff {
     public string id;
     public double timeRemainingInDays;
+    public int tickCounter;
     public byte[] data;
   }
 }
