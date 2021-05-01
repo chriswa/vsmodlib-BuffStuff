@@ -84,7 +84,7 @@ Active buffs get an `OnTick` call every 250 milliseconds (4 times per IRL second
     }
 ```
 
-If your buff makes a persistent change in `OnStart` (for example, setting something in `entity.Stats`,) you can `OnExpire` to revert it:
+If your buff makes a persistent change in `OnStart` (for example, setting something in `entity.Stats`,) you can use `OnExpire` to revert it:
 
 ```cs
     public override void OnStart() {
