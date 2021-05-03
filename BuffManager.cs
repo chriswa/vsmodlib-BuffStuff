@@ -11,23 +11,26 @@ using Vintagestory.API.Util;
 
 namespace BuffStuff {
   public class BuffManager {
-    private static readonly int TICK_MILLISECONDS = 250;
+    public static readonly int TICK_MILLISECONDS = 250;
     private static bool isInitialized = false;
     private static Dictionary<string, Type> buffTypes = new Dictionary<string, Type>();
+    private static Dictionary<Type, string> buffTypeToIds = new Dictionary<Type, string>();
     private static Dictionary<Entity, Dictionary<string, Buff>> activeBuffsByEntityAndBuffId = new Dictionary<Entity, Dictionary<string, Buff>>();
     private static Dictionary<string, List<SerializedBuff>> inactiveBuffsByPlayerUid = new Dictionary<string, List<SerializedBuff>>();
     public static void RegisterBuffType(string buffTypeId, Type buffType) {
       if (!isInitialized) { throw new System.Exception("BuffManager.RegisterBuff: must call BuffManager.Initialize() first!"); }
       if (buffTypes.ContainsKey(buffTypeId)) { throw new System.Exception($"BuffManager.RegisterBuff: buffId already registered: {buffTypeId}"); }
       buffTypes[buffTypeId] = buffType;
+      buffTypeToIds[buffType] = buffTypeId;
     }
     private static SerializedBuff serializeBuff(Buff buff) {
       MemoryStream memoryStream = new MemoryStream();
       RuntimeTypeModel.Default.Serialize(memoryStream, buff);
       var serializedBuffObjectBytes = memoryStream.ToArray();
       return new SerializedBuff() {
-        id = buff.ID,
+        id = buffTypeToIds[buff.GetType()],
         timeRemainingInDays = buff.ExpireTimestampInDays - api.World.Calendar.TotalDays,
+        expireTick = buff.ExpireTick,
         tickCounter = buff.TickCounter,
         data = serializedBuffObjectBytes // SerializerUtil.Serialize<object>(buff)
     };
@@ -38,7 +41,8 @@ namespace BuffStuff {
       try {
         buff = (Buff)RuntimeTypeModel.Default.Deserialize(serializedBuffMemoryStream, null, buffTypes[serializedBuff.id]);
       }
-      catch {
+      catch (Exception e) {
+        api.Logger.Error("BuffStuff.BuffManager failed to deserialize a buff with ID {0}: {1}", serializedBuff.id, e.ToString());
         return null;
       }
       finally {
@@ -47,6 +51,7 @@ namespace BuffStuff {
       buff.entity = entity;
       buff.ExpireTimestampInDays = api.World.Calendar.TotalDays + serializedBuff.timeRemainingInDays;
       buff.TickCounter = serializedBuff.tickCounter;
+      buff.ExpireTick = serializedBuff.expireTick;
       return buff;
     }
     private static ICoreAPI api;
@@ -79,7 +84,7 @@ namespace BuffStuff {
           var playerUid = (serverPlayer.Entity as EntityPlayer).PlayerUID;
           if (inactiveBuffsByPlayerUid.TryGetValue(playerUid, out var inactiveBuffs)) {
             var now = Now;
-            activeBuffsByEntityAndBuffId[serverPlayer.Entity] = inactiveBuffs.Select(serializedBuff => deserializeBuff(serializedBuff, serverPlayer.Entity)).Where((buff) => buff != null).ToDictionary(buff => buff.ID, buff => buff);
+            activeBuffsByEntityAndBuffId[serverPlayer.Entity] = inactiveBuffs.Select(serializedBuff => deserializeBuff(serializedBuff, serverPlayer.Entity)).Where((buff) => buff != null).ToDictionary(buff => buffTypeToIds[buff.GetType()], buff => buff);
             inactiveBuffsByPlayerUid.Remove(playerUid);
             foreach (var buffIdAndBuffPair in activeBuffsByEntityAndBuffId[serverPlayer.Entity]) {
               buffIdAndBuffPair.Value.OnJoin();
@@ -97,7 +102,7 @@ namespace BuffStuff {
             activeBuffsByEntityAndBuffId.Remove(serverPlayer.Entity);
           }
         };
-        api.Event.OnEntityDespawn += (Entity entity, EntityDespawnReason reason) => {
+        sapi.Event.OnEntityDespawn += (Entity entity, EntityDespawnReason reason) => {
           activeBuffsByEntityAndBuffId.Remove(entity);
         };
         sapi.Event.PlayerDeath += (serverPlayer, damageSource) => {
@@ -108,18 +113,21 @@ namespace BuffStuff {
           }
           activeBuffsByEntityAndBuffId.Remove(serverPlayer.Entity);
         };
-        api.World.RegisterGameTickListener((float dt) => {
+        sapi.World.RegisterGameTickListener((float dt) => {
           var now = Now;
           foreach (var entity in activeBuffsByEntityAndBuffId.Keys.ToArray()) {
             var activeBuffsByBuffId = activeBuffsByEntityAndBuffId[entity];
             foreach (var buff in activeBuffsByBuffId.Values.ToArray()) {
-              buff.TickCounter += 1;
-              if (buff.ExpireTimestampInDays < now) {
+              if (buff.ExpireTimestampInDays < now || buff.TickCounter >= buff.ExpireTick) {
                 buff.OnExpire();
                 RemoveBuff(entity, buff);
+                continue;
               }
-              else {
-                buff.OnTick();
+              buff.TickCounter += 1;
+              buff.OnTick();
+              if (buff.ExpireTimestampInDays < now || buff.TickCounter >= buff.ExpireTick) {
+                buff.OnExpire();
+                RemoveBuff(entity, buff);
               }
             }
           }
@@ -127,26 +135,45 @@ namespace BuffStuff {
       }
       isInitialized = true;
     }
+    public static Buff GetActiveBuff(Entity entity, string buffId) {
+      if (activeBuffsByEntityAndBuffId.TryGetValue(entity, out var activeBuffs)) {
+        if (activeBuffs.TryGetValue(buffId, out var buff)) {
+          return buff;
+        }
+      }
+      return null;
+    }
+    public static bool IsBuffActive(Entity entity, string buffId) {
+      return GetActiveBuff(entity, buffId) != null;
+    }
+    /// <summary>
+    /// This is intended to be called by `Buff.Apply`, you probably shouldn't call it directly.
+    /// </summary>
     internal static void ApplyBuff(Entity entity, Buff buff) {
       if (!isInitialized) { throw new System.Exception("BuffManager.RegisterBuff: must call BuffManager.Initialize() first"); }
-      if (!buffTypes.ContainsKey(buff.ID)) { throw new System.Exception($"BuffManager.RegisterBuff: must call BuffManager.RegisterBuffType() first for buff ID {buff.ID}"); }
+      if (!buffTypeToIds.ContainsKey(buff.GetType())) { throw new System.Exception($"BuffManager.RegisterBuff: must call BuffManager.RegisterBuffType() first for buff type {buff.GetType().FullName}"); }
       buff.entity = entity; // set entity! this is otherwise unsettable, because it's internal
       Dictionary<string, Buff> activeBuffs;
       if (!activeBuffsByEntityAndBuffId.TryGetValue(entity, out activeBuffs)) { // if entity doesn't have a dict pair, create one
         activeBuffs = new Dictionary<string, Buff>();
         activeBuffsByEntityAndBuffId[entity] = activeBuffs;
       }
-      if (activeBuffsByEntityAndBuffId[entity].TryGetValue(buff.ID, out var oldBuff)) {
+      var buffId = buffTypeToIds[buff.GetType()];
+      if (activeBuffsByEntityAndBuffId[entity].TryGetValue(buffId, out var oldBuff)) {
         buff.OnStack(oldBuff);
       }
       else {
         buff.OnStart();
       }
-      activeBuffs[buff.ID] = buff;
+      activeBuffs[buffId] = buff;
     }
+    /// <summary>
+    /// This is intended to be called by `Buff.Remove`, you probably shouldn't call it directly.
+    /// </summary>
     internal static bool RemoveBuff(Entity entity, Buff buff) { // n.b. does not call any Buff event callbacks!
       if (activeBuffsByEntityAndBuffId.TryGetValue(entity, out var activeBuffs)) {
-        if (activeBuffs.Remove(buff.ID)) {
+        var buffId = buffTypeToIds[buff.GetType()];
+        if (activeBuffs.Remove(buffId)) {
           if (activeBuffs.Count == 0) {
             activeBuffsByEntityAndBuffId.Remove(entity); // cleanup dictionary pair with now-empty list!
           }
