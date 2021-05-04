@@ -236,4 +236,9 @@ This buff saps the player's health slowly, over the course of 5 seconds. If you 
 
 You can use `BuffManager.GetActiveBuff(Entity entity, string buffId)` or `BuffManager.IsBuffActive(Entity entity, string buffId)` to look up an active buff on an entity by its registered `ID`.
 
+## TODO
+
+- Test with non-player entities
+- Transmit buffs from server to client (so that client code can check if buffs are active)
+  - Probably only useful to send each player their own buffs?
 
